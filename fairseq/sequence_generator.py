@@ -12,6 +12,7 @@ import torch.nn as nn
 from torch import Tensor
 
 from fairseq import search, utils
+from fairseq import mc_dropout_config as config
 from fairseq.data import data_utils
 from fairseq.models import FairseqIncrementalDecoder
 from fairseq.ngram_repeat_block import NGramRepeatBlock
@@ -123,12 +124,12 @@ class SequenceGenerator(nn.Module):
             hasattr(self.search, "needs_src_lengths") and self.search.needs_src_lengths
         )
 
-        self.model.eval()
+        self.model.train()
 
         self.lm_model = lm_model
         self.lm_weight = lm_weight
         if self.lm_model is not None:
-            self.lm_model.eval()
+            self.lm_model.train()
 
     def cuda(self):
         self.model.cuda()
@@ -804,7 +805,12 @@ class EnsembleModel(nn.Module):
     def forward_encoder(self, net_input: Dict[str, Tensor]):
         if not self.has_encoder():
             return None
-        return [model.encoder.forward_torchscript(net_input) for model in self.models]
+        results = []
+        for i, model in enumerate(self.models):
+            if config.model_seeds is not None:
+                torch.manual_seed(config.model_seeds[i])
+            results.append(model.encoder.forward_torchscript(net_input))
+        return results
 
     @torch.jit.export
     def forward_decoder(
@@ -818,6 +824,8 @@ class EnsembleModel(nn.Module):
         avg_attn: Optional[Tensor] = None
         encoder_out: Optional[Dict[str, List[Tensor]]] = None
         for i, model in enumerate(self.models):
+            if config.model_seeds is not None:
+                torch.manual_seed(config.model_seeds[i])
             if self.has_encoder():
                 encoder_out = encoder_outs[i]
             # decode each model
