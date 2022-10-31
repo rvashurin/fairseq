@@ -123,12 +123,12 @@ class SequenceGenerator(nn.Module):
             hasattr(self.search, "needs_src_lengths") and self.search.needs_src_lengths
         )
 
-        self.model.eval()
+        self.model.train()
 
         self.lm_model = lm_model
         self.lm_weight = lm_weight
         if self.lm_model is not None:
-            self.lm_model.eval()
+            self.lm_model.train()
 
     def cuda(self):
         self.model.cuda()
