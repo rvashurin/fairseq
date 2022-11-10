@@ -9,7 +9,6 @@ import torch.nn as nn
 from fairseq import utils
 from torch import Tensor
 
-
 class FairseqDecoder(nn.Module):
     """Base class for decoders."""
 
@@ -87,11 +86,16 @@ class FairseqDecoder(nn.Module):
             return out.exp_() if not log_probs else out
 
         logits = net_output[0]
+        # if log_probs:
+        #     return utils.log_softmax(logits, dim=-1, onnx_trace=self.onnx_trace)
+        # else:
+        #     return utils.softmax(logits, dim=-1, onnx_trace=self.onnx_trace)
+
         if log_probs == 'log':
             return utils.log_softmax(logits, dim=-1, onnx_trace=self.onnx_trace)
         elif log_probs == 'probs':
             return utils.softmax(logits, dim=-1, onnx_trace=self.onnx_trace)
-        elif log_probs == 'both'
+        elif log_probs == 'both':
             log_probs = utils.log_softmax(logits, dim=-1, onnx_trace=self.onnx_trace)
             probs = utils.softmax(logits, dim=-1, onnx_trace=self.onnx_trace)
             return (log_probs, probs)

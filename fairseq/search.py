@@ -14,6 +14,8 @@ from fairseq.token_generation_constraints import (
     UnorderedConstraintState,
 )
 from torch import Tensor
+from fairseq.utils import get_ue
+
 
 
 class Search(nn.Module):
@@ -170,6 +172,7 @@ class PrefixConstrainedBeamSearch(Search):
         self,
         step: int,
         lprobs: Tensor,
+        models_lprobs: Tensor,
         scores: Tensor,
         prev_output_tokens: Tensor,
         original_batch_idxs: Tensor,
@@ -181,16 +184,19 @@ class PrefixConstrainedBeamSearch(Search):
             prev_output_tokens,
             original_batch_idxs,
         ).view(bsz, beam_size, vocab_size)
-
+    
         if step == 0:
             # at the first step all hypotheses are equally likely, so use
             # only the first beam
             lprobs = lprobs[:, ::beam_size, :].contiguous()
+            models_lprobs = [model_lprobs[:, ::beam_size, :].contiguous().tile([1, beam_size, 1]) for model_lprobs in models_lprobs]
+            eentropy, pentropy, bald, epkl, rmi = get_ue(models_lprobs)
         else:
             # make probs contain cumulative scores for each hypothesis
             assert scores is not None
+            eentropy, pentropy, bald, epkl, rmi = get_ue(models_lprobs)
             lprobs = lprobs + scores[:, :, step - 1].unsqueeze(-1)
-
+            
         top_prediction = torch.topk(
             lprobs.view(bsz, -1),
             k=min(
@@ -200,11 +206,12 @@ class PrefixConstrainedBeamSearch(Search):
                 lprobs.view(bsz, -1).size(1) - 1,  # -1 so we never select pad
             ),
         )
+
         scores_buf = top_prediction[0]
         indices_buf = top_prediction[1]
         beams_buf = indices_buf // vocab_size
         indices_buf = indices_buf.fmod(vocab_size)
-        return scores_buf, indices_buf, beams_buf
+        return scores_buf, indices_buf, beams_buf, eentropy, pentropy, bald, epkl, rmi
 
 
 class LexicallyConstrainedBeamSearch(Search):
