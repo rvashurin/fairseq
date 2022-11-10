@@ -12,12 +12,16 @@ import logging
 import os
 import sys
 import warnings
-from itertools import accumulate
+from itertools import accumulate, permutations
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor
+
+from scipy.stats import entropy
+import numpy as np
+
 
 if TYPE_CHECKING:
     from fairseq.modules.multihead_attention import MultiheadAttention
@@ -949,3 +953,28 @@ def hotreload_function(name=None):
         return func_wrapper
 
     return hotreload_decorator
+
+
+def get_ue(models_distributions):
+    """Calculates entropy, BALD, RMI and EPKL measures of uncertainty"""
+    # [ensemble_size, batch_size, beam_size, vocab_size]
+    models_distributions = torch.exp(torch.stack(models_distributions))
+    
+    ensemble_distribution = torch.mean(models_distributions, dim=0)
+        
+    eentropy = torch.mean(torch.tensor(np.array([entropy(model_distribution.cpu(), axis=-1) for model_distribution in models_distributions])), dim=0).to(ensemble_distribution)
+    pentropy = torch.tensor(entropy(ensemble_distribution.cpu(), axis=-1)).to(ensemble_distribution)
+    
+    bald = pentropy - eentropy
+    
+    permutations_of_models = permutations(range(models_distributions.size()[0]), 2)
+    kls = []
+    for i, j in permutations_of_models:
+        kls.append(entropy(models_distributions[i, :, :, :].cpu(), qk=models_distributions[j, :, :, :].cpu(), axis=-1))
+    epkl = torch.tensor(np.mean(kls, axis=0)).to(ensemble_distribution)
+    
+    rmi = epkl - bald
+    
+    return eentropy, pentropy, bald, epkl, rmi
+
+    

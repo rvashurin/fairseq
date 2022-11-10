@@ -12,9 +12,11 @@ import torch.nn as nn
 from torch import Tensor
 
 from fairseq import search, utils
+from fairseq import mc_dropout_config as config
 from fairseq.data import data_utils
 from fairseq.models import FairseqIncrementalDecoder
 from fairseq.ngram_repeat_block import NGramRepeatBlock
+
 
 
 class SequenceGenerator(nn.Module):
@@ -123,12 +125,12 @@ class SequenceGenerator(nn.Module):
             hasattr(self.search, "needs_src_lengths") and self.search.needs_src_lengths
         )
 
-        self.model.eval()
+        self.model.train()
 
         self.lm_model = lm_model
         self.lm_weight = lm_weight
         if self.lm_model is not None:
-            self.lm_model.eval()
+            self.lm_model.train()
 
     def cuda(self):
         self.model.cuda()
@@ -298,6 +300,12 @@ class SequenceGenerator(nn.Module):
         )  # +2 for eos and pad
         tokens[:, 0] = self.eos if bos_token is None else bos_token
         attn: Optional[Tensor] = None
+        
+        eentropies = torch.full_like(tokens, 0).type(torch.FloatTensor).to(tokens.device)
+        pentropies = torch.full_like(tokens, 0).type(torch.FloatTensor).to(tokens.device)
+        balds = torch.full_like(tokens, 0).type(torch.FloatTensor).to(tokens.device)
+        epkls = torch.full_like(tokens, 0).type(torch.FloatTensor).to(tokens.device)
+        rmis = torch.full_like(tokens, 0).type(torch.FloatTensor).to(tokens.device)
 
         # A list that indicates candidates that should be ignored.
         # For example, suppose we're sampling and have already finalized 2/5
@@ -357,13 +365,13 @@ class SequenceGenerator(nn.Module):
             with torch.autograd.profiler.record_function(
                 "EnsembleModel: forward_decoder"
             ):
-                lprobs, avg_attn_scores = self.model.forward_decoder(
+                # lprobs, avg_attn_scores, eentropy, pentropy, bald, epkl, rmi = self.model.forward_decoder(
+                lprobs, avg_attn_scores, models_lprobs = self.model.forward_decoder(
                     tokens[:, : step + 1],
                     encoder_outs,
                     incremental_states,
                     self.temperature,
                 )
-
             if self.lm_model is not None:
                 lm_out = self.lm_model(tokens[:, : step + 1])
                 probs = self.lm_model.get_normalized_probs(
@@ -372,6 +380,15 @@ class SequenceGenerator(nn.Module):
                 probs = probs[:, -1, :] * self.lm_weight
                 lprobs += probs
 
+            # What happens here and further down?
+            
+            #################
+            # This is the part where probability distributions from decoder over vocabulary
+            # undergo additional post-processing. In basic implementation of ensembles in fairseq
+            # this only happens for averaged probabilities. For uncertainty estimation this must
+            # be done for individual model outputs also
+            #################
+            
             lprobs[lprobs != lprobs] = torch.tensor(-math.inf).to(lprobs)
 
             lprobs[:, self.pad] = -math.inf  # never select pad
@@ -421,14 +438,60 @@ class SequenceGenerator(nn.Module):
             if self.repeat_ngram_blocker is not None:
                 lprobs = self.repeat_ngram_blocker(tokens, lprobs, bsz, beam_size, step)
 
+            #############
+            # HERE GOES REPEATING: REFACTOR THIS!
+            # This is the same post-processing but for individual outputs.
+            #############
+            
+            postprocessed_models_lprobs = []
+            for model_lprobs in models_lprobs:
+                model_lprobs[model_lprobs != model_lprobs] = torch.tensor(-math.inf).to(model_lprobs)
+
+                model_lprobs[:, self.pad] = -math.inf  # never select pad
+                model_lprobs[:, self.unk] -= self.unk_penalty  # apply unk penalty
+
+                # handle max length constraint
+                if step >= max_len:
+                    model_lprobs[:, : self.eos] = -math.inf
+                    model_lprobs[:, self.eos + 1 :] = -math.inf
+
+                # handle prefix tokens (possibly with different lengths)
+                if (
+                    prefix_tokens is not None
+                    and step < prefix_tokens.size(1)
+                    and step < max_len
+                ):
+                    model_lprobs, tokens, scores = self._prefix_tokens(
+                        step, model_lprobs, scores, tokens, prefix_tokens, beam_size
+                    )
+                else:
+                    if step < self.min_len:
+                        # minimum length constraint (does not apply if using prefix_tokens)
+                        model_lprobs[:, self.eos] = -math.inf
+
+                    if self.token_indices_to_suppress is not None:
+                        model_lprobs[:, self.token_indices_to_suppress] = -math.inf
+
+                if self.repeat_ngram_blocker is not None:
+                    model_lprobs = self.repeat_ngram_blocker(tokens, model_lprobs, bsz, beam_size, step)
+                
+                postprocessed_models_lprobs.append(model_lprobs)
+                
             # Shape: (batch, cand_size)
-            cand_scores, cand_indices, cand_beams = self.search.step(
+            cand_scores, cand_indices, cand_beams, eentropy, pentropy, bald, epkl, rmi = self.search.step(
                 step,
                 lprobs.view(bsz, -1, self.vocab_size),
+                [model_lprobs.view(bsz, -1, self.vocab_size) for model_lprobs in postprocessed_models_lprobs],
                 scores.view(bsz, beam_size, -1)[:, :, :step],
                 tokens[:, : step + 1],
                 original_batch_idxs,
             )
+            
+            # eentropies.append(eentropy)
+            # pentropies.append(pentropy)
+            # balds.append(bald)
+            # epkls.append(epkl)
+            # rmis.append(rmi)
 
             # cand_bbsz_idx contains beam indices for the top candidate
             # hypotheses, with a range of values: [0, bsz*beam_size),
@@ -446,19 +509,44 @@ class SequenceGenerator(nn.Module):
             eos_bbsz_idx = torch.masked_select(
                 cand_bbsz_idx[:, :beam_size], mask=eos_mask[:, :beam_size]
             )
-
+                        
             finalized_sents: List[int] = []
             if eos_bbsz_idx.numel() > 0:
                 eos_scores = torch.masked_select(
                     cand_scores[:, :beam_size], mask=eos_mask[:, :beam_size]
                 )
-
+                eos_eentropy = torch.masked_select(
+                    eentropy[:, :beam_size], mask=eos_mask[:, :beam_size]
+                )
+                eos_pentropy = torch.masked_select(
+                    pentropy[:, :beam_size], mask=eos_mask[:, :beam_size]
+                )
+                eos_bald = torch.masked_select(
+                    bald[:, :beam_size], mask=eos_mask[:, :beam_size]
+                )
+                eos_epkl = torch.masked_select(
+                    epkl[:, :beam_size], mask=eos_mask[:, :beam_size]
+                )
+                eos_rmi = torch.masked_select(
+                    rmi[:, :beam_size], mask=eos_mask[:, :beam_size]
+                )
+                
                 finalized_sents = self.finalize_hypos(
                     step,
                     eos_bbsz_idx,
                     eos_scores,
                     tokens,
                     scores,
+                    eentropies,
+                    pentropies,
+                    balds,
+                    epkls,
+                    rmis,
+                    eos_eentropy,
+                    eos_pentropy,
+                    eos_bald,
+                    eos_epkl,
+                    eos_rmi,
                     finalized,
                     finished,
                     beam_size,
@@ -507,6 +595,12 @@ class SequenceGenerator(nn.Module):
 
                 scores = scores.view(bsz, -1)[batch_idxs].view(new_bsz * beam_size, -1)
                 tokens = tokens.view(bsz, -1)[batch_idxs].view(new_bsz * beam_size, -1)
+                eentropies = eentropies.view(bsz, -1)[batch_idxs].view(new_bsz * beam_size, -1)
+                pentropies = pentropies.view(bsz, -1)[batch_idxs].view(new_bsz * beam_size, -1)
+                balds = balds.view(bsz, -1)[batch_idxs].view(new_bsz * beam_size, -1)
+                epkls = epkls.view(bsz, -1)[batch_idxs].view(new_bsz * beam_size, -1)
+                rmis = rmis.view(bsz, -1)[batch_idxs].view(new_bsz * beam_size, -1)
+                
                 if attn is not None:
                     attn = attn.view(bsz, -1)[batch_idxs].view(
                         new_bsz * beam_size, attn.size(1), -1
@@ -552,7 +646,7 @@ class SequenceGenerator(nn.Module):
             active_scores = active_scores.view(-1)
 
             # copy tokens and scores for active hypotheses
-
+            
             # Set the tokens for each beam (can select the same row more than once)
             tokens[:, : step + 1] = torch.index_select(
                 tokens[:, : step + 1], dim=0, index=active_bbsz_idx
@@ -568,6 +662,43 @@ class SequenceGenerator(nn.Module):
             scores.view(bsz, beam_size, -1)[:, :, step] = torch.gather(
                 cand_scores, dim=1, index=active_hypos
             )
+            
+            # Do the same for uncertainty estimate containers:
+            eentropies[:, : step] = torch.index_select(
+                eentropies[:, : step], dim=0, index=active_bbsz_idx
+            )
+            eentropies.view(bsz, beam_size, -1)[:, :, step] = torch.gather(
+                eentropy, dim=1, index=active_hypos
+            )
+            
+            pentropies[:, : step] = torch.index_select(
+                pentropies[:, : step], dim=0, index=active_bbsz_idx
+            )
+            pentropies.view(bsz, beam_size, -1)[:, :, step + 1] = torch.gather(
+                pentropy, dim=1, index=active_hypos
+            )
+            
+            balds[:, : step] = torch.index_select(
+                balds[:, : step], dim=0, index=active_bbsz_idx
+            )
+            balds.view(bsz, beam_size, -1)[:, :, step] = torch.gather(
+                bald, dim=1, index=active_hypos
+            )
+            
+            epkls[:, : step] = torch.index_select(
+                epkls[:, : step], dim=0, index=active_bbsz_idx
+            )
+            epkls.view(bsz, beam_size, -1)[:, :, step] = torch.gather(
+                epkl, dim=1, index=active_hypos
+            )
+            
+            rmis[:, : step] = torch.index_select(
+                rmis[:, : step], dim=0, index=active_bbsz_idx
+            )
+            rmis.view(bsz, beam_size, -1)[:, :, step] = torch.gather(
+                rmi, dim=1, index=active_hypos
+            )
+
 
             # Update constraints based on which candidates were selected for the next beam
             self.search.update_constraints(active_hypos)
@@ -580,7 +711,7 @@ class SequenceGenerator(nn.Module):
 
             # reorder incremental state in decoder
             reorder_state = active_bbsz_idx
-
+        
         # sort by score descending
         for sent in range(len(finalized)):
             scores = torch.tensor(
@@ -591,6 +722,7 @@ class SequenceGenerator(nn.Module):
             finalized[sent] = torch.jit.annotate(
                 List[Dict[str, Tensor]], finalized[sent]
             )
+    
         return finalized
 
     def _prefix_tokens(
@@ -634,6 +766,16 @@ class SequenceGenerator(nn.Module):
         eos_scores,
         tokens,
         scores,
+        eentropies,
+        pentropies,
+        balds,
+        epkls,
+        rmis,
+        eos_eentropy,
+        eos_pentropy,
+        eos_bald,
+        eos_epkl,
+        eos_rmi,
         finalized: List[List[Dict[str, Tensor]]],
         finished: List[bool],
         beam_size: int,
@@ -657,13 +799,31 @@ class SequenceGenerator(nn.Module):
         tokens_clone = tokens.index_select(0, bbsz_idx)[
             :, 1 : step + 2
         ]  # skip the first index, which is EOS
-
         tokens_clone[:, step] = self.eos
+        
         attn_clone = (
             attn.index_select(0, bbsz_idx)[:, :, 1 : step + 2]
             if attn is not None
             else None
         )
+        
+        eentropies_clone = eentropies.index_select(0, bbsz_idx)[:, : step + 1]
+        pentropies_clone = pentropies.index_select(0, bbsz_idx)[:, : step + 1]
+        balds_clone = balds.index_select(0, bbsz_idx)[:, : step + 1]
+        epkls_clone = epkls.index_select(0, bbsz_idx)[:, : step + 1]
+        rmis_clone = rmis.index_select(0, bbsz_idx)[:, : step + 1]
+                
+        eentropies_clone[:, step] = eos_eentropy
+        pentropies_clone[:, step] = eos_pentropy
+        balds_clone[:, step] = eos_bald
+        epkls_clone[:, step] = eos_epkl
+        rmis_clone[:, step] = eos_rmi
+        
+        cum_eentropies = (torch.sum(eentropies_clone, dim=-1) / (step + 1)) * torch.exp(eos_scores)
+        cum_pentropies = (torch.sum(pentropies_clone, dim=-1) / (step + 1)) * torch.exp(eos_scores)
+        cum_balds = (torch.sum(balds_clone, dim=-1) / (step + 1)) * torch.exp(eos_scores)
+        cum_epkls = (torch.sum(epkls_clone, dim=-1) / (step + 1)) * torch.exp(eos_scores)
+        cum_rmis = (torch.sum(rmis_clone, dim=-1) / (step + 1)) * torch.exp(eos_scores)
 
         # compute scores per token position
         pos_scores = scores.index_select(0, bbsz_idx)[:, : step + 1]
@@ -721,6 +881,12 @@ class SequenceGenerator(nn.Module):
                         "attention": hypo_attn,  # src_len x tgt_len
                         "alignment": torch.empty(0),
                         "positional_scores": pos_scores[i],
+                        "cumulative_uncertainties": {"eentropy": cum_eentropies[i],
+                                                     "pentropy": cum_pentropies[i],
+                                                     "bald": cum_balds[i],
+                                                     "epkl": cum_epkls[i],
+                                                     "rmi": cum_rmis[i],
+                                                    }
                     }
                 )
 
@@ -796,7 +962,10 @@ class EnsembleModel(nn.Module):
     def set_decoder_beam_size(self, beam_size):
         """Set beam size for efficient beamable enc-dec attention."""
         if beam_size > 1:
-            for model in self.models:
+            for i, model in enumerate(self.models):
+                if len(config.model_seeds) > 0:
+                    torch.manual_seed(config.model_seeds[i])
+
                 if hasattr(model, "set_beam_size"):
                     model.set_beam_size(beam_size)
 
@@ -804,7 +973,12 @@ class EnsembleModel(nn.Module):
     def forward_encoder(self, net_input: Dict[str, Tensor]):
         if not self.has_encoder():
             return None
-        return [model.encoder.forward_torchscript(net_input) for model in self.models]
+        results = []
+        for i, model in enumerate(self.models):
+            if len(config.model_seeds) > 0:
+                torch.manual_seed(config.model_seeds[i])
+            results.append(model.encoder.forward_torchscript(net_input))
+        return results
 
     @torch.jit.export
     def forward_decoder(
@@ -818,6 +992,8 @@ class EnsembleModel(nn.Module):
         avg_attn: Optional[Tensor] = None
         encoder_out: Optional[Dict[str, List[Tensor]]] = None
         for i, model in enumerate(self.models):
+            if len(config.model_seeds) > 0:
+                torch.manual_seed(config.model_seeds[i])
             if self.has_encoder():
                 encoder_out = encoder_outs[i]
             # decode each model
@@ -852,26 +1028,29 @@ class EnsembleModel(nn.Module):
                 None if decoder_len <= 1 else decoder_out[1],
             )
             probs = model.get_normalized_probs(
-                decoder_out_tuple, log_probs=True, sample=None
+                decoder_out_tuple, log_probs='log', sample=None
             )
+            
             probs = probs[:, -1, :]
             if self.models_size == 1:
                 return probs, attn
-
+            
             log_probs.append(probs)
             if attn is not None:
                 if avg_attn is None:
                     avg_attn = attn
                 else:
                     avg_attn.add_(attn)
-
+                    
         avg_probs = torch.logsumexp(torch.stack(log_probs, dim=0), dim=0) - math.log(
             self.models_size
         )
-
+        
         if avg_attn is not None:
             avg_attn.div_(self.models_size)
-        return avg_probs, avg_attn
+
+        return avg_probs, avg_attn, log_probs
+
 
     @torch.jit.export
     def reorder_encoder_out(
@@ -891,6 +1070,9 @@ class EnsembleModel(nn.Module):
         if not self.has_encoder():
             return new_outs
         for i, model in enumerate(self.models):
+            if len(config.model_seeds) > 0:
+                torch.manual_seed(config.model_seeds[i])
+
             assert encoder_outs is not None
             new_outs.append(
                 model.encoder.reorder_encoder_out(encoder_outs[i], new_order)
@@ -906,6 +1088,9 @@ class EnsembleModel(nn.Module):
         if not self.has_incremental_states():
             return
         for i, model in enumerate(self.models):
+            if len(config.model_seeds) > 0:
+                torch.manual_seed(config.model_seeds[i])
+
             model.decoder.reorder_incremental_state_scripting(
                 incremental_states[i], new_order
             )

@@ -63,7 +63,7 @@ class BaseFairseqModel(nn.Module):
     def get_normalized_probs(
         self,
         net_output: Tuple[Tensor, Optional[Dict[str, List[Optional[Tensor]]]]],
-        log_probs: bool,
+        log_probs: str,
         sample: Optional[Dict[str, Tensor]] = None,
     ):
         """Get normalized probabilities (or log probs) from a net's output."""
@@ -76,7 +76,7 @@ class BaseFairseqModel(nn.Module):
     def get_normalized_probs_scriptable(
         self,
         net_output: Tuple[Tensor, Optional[Dict[str, List[Optional[Tensor]]]]],
-        log_probs: bool,
+        log_probs: str,
         sample: Optional[Dict[str, Tensor]] = None,
     ):
         """Scriptable helper function for get_normalized_probs in ~BaseFairseqModel"""
@@ -211,12 +211,13 @@ class BaseFairseqModel(nn.Module):
         apply_make_generation_fast_(self, "")
 
         def train(mode=True):
-            if mode:
-                raise RuntimeError("cannot train after make_generation_fast")
+            self.train()
+#             if mode:
+#                 raise RuntimeError("cannot train after make_generation_fast")
 
-        # this model should no longer be used for training
-        self.eval()
-        self.train = train
+#         # this model should no longer be used for training
+#         self.eval()
+#         self.train = train
 
     def prepare_for_onnx_export_(self, **kwargs):
         """Make model exportable via ONNX trace."""

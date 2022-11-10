@@ -26,8 +26,8 @@ class BARTHubInterface(GeneratorHubInterface):
     Usage: https://github.com/pytorch/fairseq/tree/main/examples/bart
     """
 
-    def __init__(self, cfg, task, model):
-        super().__init__(cfg, task, [model])
+    def __init__(self, cfg, task, models):
+        super().__init__(cfg, task, models)
         self.model = self.models[0]
 
     def encode(
